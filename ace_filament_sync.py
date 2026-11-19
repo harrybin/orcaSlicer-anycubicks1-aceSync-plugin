@@ -4,9 +4,9 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "ACE Filament Sync for Rinkhals"
-# description = "Read Kobra S1 ACE slots, sync a preset color, and import missing Spoolman spools."
+# description = "Read Kobra S1 ACE slots and import missing Spoolman spools."
 # author = "harrybin"
-# version = "0.4.6"
+# version = "0.4.14"
 # ///
 
 """Dependency-free, read-only Moonraker client and OrcaSlicer script plugin."""
@@ -17,6 +17,7 @@ import ipaddress
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import urlsplit
 
 
@@ -24,35 +25,40 @@ QUERY = "/printer/objects/query?filament_hub"
 SPOOLMAN_STATUS = "/server/spoolman/status"
 SPOOLMAN_PROXY = "/server/spoolman/proxy"
 MAX_RESPONSE = 128 * 1024
-COLOR_KEY = "default_filament_colour"
 TITLE = "ACE Filament Sync"
-PRESET_TITLE = "ACE Preset Color"
 SPOOLMAN_TITLE = "ACE Spoolman Sync"
 PANEL_TITLE = "Anycubic ACE sync"
-DEFAULT_CONFIG = {"ace_slot": 1, "orca_slot": 1, "preview_only": False, "open_on_startup": True}
+DEFAULT_CONFIG = {"preview_only": False, "open_on_startup": True, "sync_spoolman_after_ace": False}
 DENSITY = {"PLA": 1.24, "PETG": 1.27, "ABS": 1.04, "ASA": 1.07}
 
 PANEL_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root { color-scheme: light dark; overflow-y: scroll; }
-  body { margin: 0; padding: 8px; background: Canvas; color: CanvasText;
+  :root { color-scheme: light dark; overflow-y: auto; scrollbar-gutter: stable; }
+  body { margin: 0; background: Canvas; color: CanvasText;
          font: 13px/1.3 system-ui, sans-serif; }
-  .overview { display: grid; grid-template-columns: minmax(0, 1fr) clamp(64px, 30vw, 92px);
+  main { padding: 8px; }
+  main:focus-visible, #spoolman:focus-visible { outline: 2px solid Highlight; outline-offset: -2px; }
+  .overview { display: grid; grid-template-columns: minmax(0, 1fr) max-content;
               gap: 8px; align-items: start; }
   ol { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
        gap: 4px 8px; padding: 0; margin: 0; list-style: none; }
   li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 4px; align-items: start;
        padding: 4px 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 22%, Canvas);
        overflow-wrap: anywhere; }
-  .dot { width: 12px; height: 12px; margin-top: 2px; border: 1px solid GrayText;
+  .dot { width: 18px; height: 18px; border: 1px solid GrayText;
          border-radius: 50%; box-sizing: border-box; }
   strong { display: block; }
   .hex-line { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; }
   code { font-size: 12px; user-select: text; }
   .actions { display: grid; gap: 4px; }
   button { font: inherit; min-width: 0; min-height: 28px; padding: 4px; cursor: pointer; }
+  .actions button:not([hidden]) { display: flex; align-items: center; justify-content: center;
+                    gap: 4px; padding-inline: 6px; white-space: nowrap; }
+  .actions svg { flex: none; width: 16px; height: 16px; fill: none; stroke: currentColor;
+                 stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; }
+  #refresh { min-height: 34px; }
   button:disabled { cursor: default; }
   button:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
   .copy-hex { display: inline-grid; place-items: center; min-height: 22px; width: 22px;
@@ -62,9 +68,10 @@ PANEL_HTML = r"""<!doctype html>
   .copy-hex[data-copied] .copy-icon, .copy-hex:not([data-copied]) .check-icon { display: none; }
   #copy-status:not(:empty) { margin-top: 4px; }
   #status, #spoolman { margin: 4px 0 0; overflow-wrap: anywhere; }
-  #spoolman { white-space: pre-line; }
+  #spoolman { white-space: pre-line; max-height: 4lh; overflow-y: auto; scrollbar-gutter: stable; }
   @media (max-width: 250px) {
-    body { padding: 4px; font-size: 12px; }
+    body { font-size: 12px; }
+    main { padding: 4px; }
     .overview, ol { column-gap: 4px; }
     li { column-gap: 3px; padding: 3px 0; }
     code { font-size: 11px; }
@@ -73,16 +80,24 @@ PANEL_HTML = r"""<!doctype html>
   }
 </style></head>
 <body>
+<main tabindex="0" aria-label="ACE slots and sync results">
 <div class="overview">
   <ol id="slots" aria-label="ACE filament slots"></ol>
   <div class="actions">
-    <button type="button" id="refresh">Refresh slots</button>
-    <button type="button" id="import-spools">Import spools</button>
+    <button type="button" id="refresh" title="Refresh ACE slot materials and colors without changing anything.">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 16H3V5h14v4M6.5 8v3M9 8v2M11.5 8v1M14 8v1M17.5 13.5A3.5 3.5 0 1 0 17 17M17.5 10.5v3h-3"/></svg>
+      ACE sync
+    </button>
+    <button type="button" id="import-spools" title="Check for missing ACE spools and ask before adding them to Spoolman.">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M13.2 6.5a6.6 6.6 0 1 0-.8 8.5M13 13h6m-3-3v6"/><circle cx="7.5" cy="10" r="2"/></svg>
+      Spoolman
+    </button>
   </div>
 </div>
 <div id="copy-status" role="status"></div>
 <p id="status" role="status">Refresh to read the selected printer's ACE slots.</p>
-<p id="spoolman" role="status" hidden></p>
+<p id="spoolman" role="status" aria-label="Spoolman log" tabindex="0" hidden></p>
+</main>
 <script>
   const slots = document.querySelector('#slots');
   const copyStatus = document.querySelector('#copy-status');
@@ -91,10 +106,11 @@ PANEL_HTML = r"""<!doctype html>
   const refresh = document.querySelector('#refresh');
   const importSpools = document.querySelector('#import-spools');
   async function copyHex(button, value) {
+    const digits = value.textContent.slice(1);
     let copied = false;
     try {
       if (navigator.clipboard) {
-        await navigator.clipboard.writeText(value.textContent);
+        await navigator.clipboard.writeText(digits);
         copied = true;
       }
     } catch (error) {
@@ -105,6 +121,7 @@ PANEL_HTML = r"""<!doctype html>
     if (!copied) {
       const range = document.createRange();
       range.selectNodeContents(value);
+      range.setStart(value.firstChild, 1);
       const selection = window.getSelection();
       selection.removeAllRanges();
       selection.addRange(range);
@@ -119,7 +136,7 @@ PANEL_HTML = r"""<!doctype html>
       slots.querySelector('[data-copied]')?.removeAttribute('data-copied');
       button.setAttribute('data-copied', '');
     }
-    copyStatus.textContent = copied ? `Copied ${value.textContent}.` :
+    copyStatus.textContent = copied ? `Copied ${digits}.` :
       'Clipboard unavailable. Press Ctrl+C (Cmd+C on Mac) to copy the selected code.';
   }
   function render(rows) {
@@ -141,7 +158,7 @@ PANEL_HTML = r"""<!doctype html>
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'copy-hex';
-        button.title = `Copy ACE ${row.number} color ${color}`;
+        button.title = `Copy ACE ${row.number} color ${color.slice(1)}`;
         button.setAttribute('aria-label', button.title);
         button.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor"
           stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -175,6 +192,7 @@ PANEL_HTML = r"""<!doctype html>
     status.textContent = data.status;
     spoolman.hidden = !data.spoolman;
     spoolman.textContent = data.spoolman ? `Spoolman: ${data.spoolman}` : '';
+    spoolman.scrollTop = 0;
     refresh.disabled = importSpools.disabled = data.busy;
   });
 </script></body></html>"""
@@ -182,6 +200,18 @@ PANEL_HTML = r"""<!doctype html>
 
 class SyncError(ValueError):
     """A user-actionable failure."""
+
+
+def panel_html(sync_spoolman_after_ace):
+    if not sync_spoolman_after_ace:
+        return PANEL_HTML
+    return PANEL_HTML.replace(
+        'id="import-spools"', 'id="import-spools" hidden', 1,
+    ).replace(
+        "Refresh ACE slot materials and colors without changing anything.",
+        "Refresh ACE slots, then check for missing Spoolman spools. Adding spools requires confirmation.",
+        1,
+    )
 
 
 @dataclass(frozen=True)
@@ -221,19 +251,15 @@ def config_from(raw):
         raise SyncError("The Config tab must contain a valid JSON object.") from None
     if not isinstance(values, dict):
         raise SyncError("Config must be a JSON object.")
-    # Older installs saved a separate URL; never let it redirect a run to a different printer.
-    values.pop("printer_url", None)
+    # Accept settings saved by older versions without using them.
+    for key in ("printer_url", "ace_slot", "orca_slot"):
+        values.pop(key, None)
     if values.keys() - DEFAULT_CONFIG.keys():
-        raise SyncError("Config must contain only ace_slot, orca_slot, preview_only and open_on_startup.")
+        raise SyncError(f"Config must contain only: {', '.join(DEFAULT_CONFIG)}.")
     config = DEFAULT_CONFIG | values
-    for key in ("preview_only", "open_on_startup"):
+    for key in DEFAULT_CONFIG:
         if type(config[key]) is not bool:
             raise SyncError(f"{key} must be true or false.")
-    for key in ("ace_slot", "orca_slot"):
-        if type(config[key]) is not int or config[key] < 1:
-            raise SyncError(f"{key} must be a positive whole number.")
-    if config["ace_slot"] > 4:
-        raise SyncError("ace_slot must be between 1 and 4 for one ACE unit.")
     return config
 
 
@@ -517,91 +543,20 @@ def printer_url_from(host):
     return address
 
 
-def target_snapshot(host, number, material):
-    bundle = host.preset_bundle()
-    assigned = bundle.current_filament_presets()
-    if number > len(assigned) or assigned[number - 1] is None:
-        raise SyncError(f"Add an Orca project filament at slot {number} first.")
-    preset = assigned[number - 1]
-    if not preset.is_user() or preset.is_external or preset.is_project_embedded or preset.is_from_bundle():
-        raise SyncError(f"Assign a dedicated user filament preset to Orca slot {number} first.")
-    if not preset.is_compatible:
-        raise SyncError("The assigned filament preset is not compatible with this printer.")
-    if sum(other is not None and other.name == preset.name for other in assigned) != 1:
-        raise SyncError("The preset is shared by multiple project slots. Assign a dedicated copy first.")
-    if bundle.filaments.edited_preset().is_dirty:
-        raise SyncError("Save or discard the current filament preset edits before syncing.")
-    kind = preset_text(preset.config_value("filament_type"))
-    if material_family(kind) != material_family(material):
-        raise SyncError(f"ACE reports {material}; assign a matching, tuned filament preset before syncing.")
-    return preset.name, preset_text(preset.config_value(COLOR_KEY))
-
-
-def run_sync(host, config, slots, *, printer_url=None):
-    report = f"{slot_report(slots)}\n\n"
-    source = next((s for s in slots if s.number == config["ace_slot"]), None)
-    target = config["orca_slot"]
-    project_hint = ""
-    if source is not None and source.color:
-        colors = host.preset_bundle().full_config_value("filament_colour")
-        colors = [colors] if isinstance(colors, str) else colors
-        if isinstance(colors, list) and target <= len(colors) and isinstance(colors[target - 1], str):
-            current = colors[target - 1].upper()
-            if current != source.color:
-                project_hint = (
-                    f"Project slot {target} is {current}; ACE slot {source.number} is {source.color}. "
-                    "To change the project color, click the numbered color swatch in Prepare > Filament."
-                )
-        else:
-            project_hint = "No project color could be read for the configured Orca slot."
-    if config["preview_only"]:
-        host.ui.message(report + "Preview only; nothing was changed." +
-                        (f"\n\n{project_hint}" if project_hint else ""), TITLE)
-        return "ACE preview only; no preset changed."
-    if source is None or not source.color or source.material.upper() in {"", "UNKNOWN", "NONE"}:
-        raise SyncError("The selected ACE slot has no usable single-color filament information.")
-    snapshot = target_snapshot(host, target, source.material)
-    name, previous = snapshot
-    if previous.upper() == source.color:
-        host.ui.message(f"{name} already has {source.color} as its default."
-                        + (f"\n\n{project_hint}" if project_hint else ""), TITLE)
-        return "Preset already matches; no edit needed."
-    prompt = (
-        f"{report}Set the default color of Orca slot {target}, {name}, "
-        f"to {source.color} from ACE slot {source.number}?\n\n"
-        "This changes the preset default, not the current project's color. "
-        "Save the filament preset in OrcaSlicer to keep the change."
-    )
-    if host.ui.message(prompt, TITLE, "yes_no", "question") != "yes":
-        return None
-    if printer_url is not None and printer_url_from(host) != printer_url:
-        raise SyncError("The selected printer changed. Refresh the ACE slots and run sync again.")
-    if target_snapshot(host, target, source.material) != snapshot:
-        raise SyncError("The target preset changed while previewing. Run the sync again.")
-    edit = host.preset.filament.begin_update(target)
-    if edit.target_name != name:
-        raise SyncError("Orca resolved a different preset assignment. No color was applied.")
-    edit.set(COLOR_KEY, source.color)
-    edit.commit()
-    host.ui.message(f"{name}: default color set to {source.color}.\nSave the filament preset to keep it."
-                    + (f"\n\n{project_hint}" if project_hint else ""), TITLE)
-    return "Default color updated; save the filament preset to keep it."
-
-
 def panel_action(host, get_config, action, post):
     if action not in ("refresh", "import-spools"):
         raise SyncError("Unsupported ACE panel action.")
     rows = []
     spoolman = ""
     try:
+        config = config_from(get_config())
         url = printer_url_from(host)
         slots = parse_slots(read_moonraker(url))
         rows = slot_rows(slots)
-        status = "Slots refreshed."
-        if action == "import-spools":
+        status = f"Slots refreshed at {datetime.now():%Y-%m-%d %H:%M:%S} (local time)."
+        if action == "import-spools" or config["sync_spoolman_after_ace"]:
             post({"rows": rows, "status": status, "spoolman": "Checking inventory.", "busy": True})
             try:
-                config = config_from(get_config())
                 spoolman = sync_spoolman(
                     host, url, slots=slots, preview_only=config["preview_only"], show_details=False,
                 )
@@ -645,12 +600,12 @@ if orca is not None:
 
         def on_load(self):
             try:
-                auto_open = config_from(self.get_config())["open_on_startup"]
+                config = config_from(self.get_config())
             except SyncError as error:
                 print(f"{PANEL_TITLE}: skipped opening on startup: {error}", file=sys.stderr)
                 return
-            if auto_open:
-                self._open_panel()
+            if config["open_on_startup"]:
+                self._open_panel(config)
 
         def _on_panel_message(self, action):
             if action not in ("refresh", "import-spools") or self._panel_action is not None:
@@ -664,11 +619,11 @@ if orca is not None:
             finally:
                 self._panel_action = None
 
-        def _open_panel(self):
+        def _open_panel(self, config):
             if self._panel is None or not self._panel.is_open():
                 self._panel = orca.host.ui.create_dock_panel(
-                    PANEL_HTML, PANEL_TITLE, width=320, height=150,
-                    on_message=self._on_panel_message, dock="bottom",
+                    panel_html(config["sync_spoolman_after_ace"]), PANEL_TITLE, width=320, height=150,
+                    on_message=self._on_panel_message, dock="left",
                 )
             else:
                 self._panel.show()
@@ -677,23 +632,13 @@ if orca is not None:
             if self._panel_action is not None:
                 panel_action(orca.host, self.get_config, self._panel_action, self._panel.post)
                 return orca.ExecutionResult.success("ACE panel updated.")
-            self._open_panel()
-            return orca.ExecutionResult.success("ACE Sync panel opened.")
-
-    class AcePresetColorScript(orca.script.ScriptPluginCapabilityBase):
-        def get_name(self):
-            return PRESET_TITLE
-
-        def get_default_config(self):
-            return {key: DEFAULT_CONFIG[key] for key in ("ace_slot", "orca_slot", "preview_only")}
-
-        def execute(self):
-            def update(url):
+            try:
                 config = config_from(self.get_config())
-                slots = parse_slots(read_moonraker(url))
-                return run_sync(orca.host, config, slots, printer_url=url)
-
-            return execute_action(PRESET_TITLE, update)
+            except SyncError as error:
+                orca.host.ui.message(str(error), PANEL_TITLE, "ok", "warning")
+                return orca.ExecutionResult.skipped(str(error))
+            self._open_panel(config)
+            return orca.ExecutionResult.success("ACE Sync panel opened.")
 
     class AceSpoolmanScript(orca.script.ScriptPluginCapabilityBase):
         def get_name(self):
@@ -706,7 +651,6 @@ if orca is not None:
     class AceSyncPlugin(orca.base):
         def register_capabilities(self):
             orca.register_capability(AceSyncScript)
-            orca.register_capability(AcePresetColorScript)
             orca.register_capability(AceSpoolmanScript)
 
 

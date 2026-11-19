@@ -2,6 +2,7 @@ import json
 import runpy
 import threading
 import unittest
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -26,10 +27,13 @@ class StartupPanelTests(unittest.TestCase):
         fake.host = Mock()
         fake.base = object
         fake.plugin = lambda cls: cls
+        fake.register_capability = Mock()
         fake.ExecutionResult = Mock()
         with patch.dict("sys.modules", {"orca": fake}):
             plugin = runpy.run_path(sync.__file__)
         self.capability = plugin["AceSyncScript"]()
+        self.register = fake.register_capability
+        self.plugin = plugin
         self.capability.get_config = Mock(return_value="{}")
         self.host = fake.host
         self.open_panel = self.host.ui.create_dock_panel
@@ -43,6 +47,8 @@ class StartupPanelTests(unittest.TestCase):
     def test_default_startup_only_mounts_the_dock_and_manual_launch_reuses_it(self):
         self.capability.on_load()
         self.open_panel.assert_called_once()
+        self.assertEqual(self.open_panel.call_args.kwargs["dock"], "left")
+        self.assertIn('id="import-spools" title=', self.open_panel.call_args.args[0])
         self.capability.execute()
         self.open_panel.assert_called_once()
         self.open_panel.return_value.show.assert_called_once()
@@ -54,6 +60,13 @@ class StartupPanelTests(unittest.TestCase):
         self.capability.on_load()
         self.open_panel.assert_called_once()
         self.panel_action.assert_not_called()
+
+    def test_auto_spoolman_hides_separate_button_without_running_at_startup(self):
+        self.capability.get_config.return_value = '{"sync_spoolman_after_ace":true}'
+        self.capability.on_load()
+        self.assertIn('id="import-spools" hidden', self.open_panel.call_args.args[0])
+        self.panel_action.assert_not_called()
+        self.host.preset_bundle.assert_not_called()
 
     def test_explicit_startup_opt_out_keeps_manual_launch(self):
         self.capability.get_config.return_value = '{"open_on_startup":false}'
@@ -69,6 +82,13 @@ class StartupPanelTests(unittest.TestCase):
         callback("sync")
         self.panel_action.assert_not_called()
         self.open_panel.return_value.post.assert_not_called()
+
+    def test_only_panel_and_spoolman_actions_are_registered(self):
+        self.plugin["AceSyncPlugin"]().register_capabilities()
+        self.assertEqual(
+            [call.args[0]().get_name() for call in self.register.call_args_list],
+            ["ACE Filament Sync", "ACE Spoolman Sync"],
+        )
 
 
 class MoonrakerTests(unittest.TestCase):
@@ -101,8 +121,8 @@ class MoonrakerTests(unittest.TestCase):
                     "http://192.168.1.1/path", "http://localhost", "http://[::]"):
             with self.subTest(url=url), self.assertRaises(sync.SyncError):
                 sync.endpoint(url)
-        for raw in ('[]', '{"orca_slot":true}', '{"ace_slot":0}', '{"ace_slot":5}',
-                    '{"preview_only":1}', '{"open_on_startup":"true"}', '{"typo":1}'):
+        for raw in ('[]', '{"preview_only":1}', '{"open_on_startup":"true"}',
+                    '{"sync_spoolman_after_ace":"true"}', '{"typo":1}'):
             with self.subTest(raw=raw), self.assertRaises(sync.SyncError):
                 sync.config_from(raw)
         self.assertEqual(sync.endpoint("http://[::1]:7125/"), ("http", "::1", 7125))
@@ -217,25 +237,25 @@ class SpoolmanTests(unittest.TestCase):
                 url = f"http://127.0.0.1:{server.server_port}"
                 host.preset_bundle.return_value.current_printer_preset.return_value.config_value.return_value = url
                 post = Mock()
-                with patch.object(sync, "run_sync") as preset_sync:
-                    sync.panel_action(host, lambda: '{"preview_only":true}', "import-spools", post)
-                    self.assertIn("2 missing spools", post.call_args.args[0]["spoolman"])
-                    self.assertFalse(writes)
-                    host.ui.message.assert_not_called()
-                    host.ui.message.return_value = "no"
-                    sync.panel_action(host, lambda: "{}", "import-spools", post)
-                    self.assertIn("Import declined", post.call_args.args[0]["spoolman"])
-                    self.assertFalse(writes)
-                    host.ui.message.reset_mock()
-                    host.ui.message.return_value = "yes"
-                    sync.panel_action(host, lambda: "{}", "import-spools", post)
-                    self.assertEqual(post.call_args.args[0]["spoolman"], "Created 2 Spoolman spool records.")
-                    self.assertEqual(post.call_args.args[0]["status"], "Slots refreshed.")
-                    sync.panel_action(host, lambda: "{}", "import-spools", post)
-                    self.assertIn("already tracked", post.call_args.args[0]["spoolman"])
-                    host.ui.message.assert_called_once()
-                    preset_sync.assert_not_called()
-                    host.preset.filament.begin_update.assert_not_called()
+                sync.panel_action(
+                    host, lambda: '{"preview_only":true,"sync_spoolman_after_ace":true}', "refresh", post,
+                )
+                self.assertIn("2 missing spools", post.call_args.args[0]["spoolman"])
+                self.assertFalse(writes)
+                host.ui.message.assert_not_called()
+                host.ui.message.return_value = "no"
+                sync.panel_action(host, lambda: "{}", "import-spools", post)
+                self.assertIn("Import declined", post.call_args.args[0]["spoolman"])
+                self.assertFalse(writes)
+                host.ui.message.reset_mock()
+                host.ui.message.return_value = "yes"
+                sync.panel_action(host, lambda: '{"sync_spoolman_after_ace":true}', "refresh", post)
+                self.assertEqual(post.call_args.args[0]["spoolman"], "Created 2 Spoolman spool records.")
+                self.assertEqual(post.call_args.args[0]["status"], post.call_args_list[-2].args[0]["status"])
+                sync.panel_action(host, lambda: "{}", "import-spools", post)
+                self.assertIn("already tracked", post.call_args.args[0]["spoolman"])
+                host.ui.message.assert_called_once()
+                host.preset.filament.begin_update.assert_not_called()
             finally:
                 server.shutdown()
                 worker.join()
@@ -265,20 +285,8 @@ class SpoolmanTests(unittest.TestCase):
 class OrcaAdapterTests(unittest.TestCase):
     def setUp(self):
         self.host = Mock()
-        self.preset = SimpleNamespace(
-            name="ACE 1 PLA", is_user=lambda: True, is_external=False, is_project_embedded=False,
-            is_from_bundle=lambda: False, is_compatible=True,
-            config_value={"filament_type": "PLA", sync.COLOR_KEY: "#FFFFFF"}.get,
-        )
         self.bundle = self.host.preset_bundle.return_value
-        self.bundle.current_filament_presets.return_value = [self.preset]
-        self.bundle.filaments.edited_preset.return_value.is_dirty = False
-        self.host.ui.message.return_value = "yes"
         self.editor = self.host.preset.filament
-        self.edit = SimpleNamespace(target_name=self.preset.name, set=Mock(), commit=Mock())
-        self.editor.begin_update.return_value = self.edit
-        self.slots = sync.parse_slots(payload(spool()))
-        self.config = sync.config_from("{}")
         status = patch.object(sync, "spoolman_online", return_value=False)
         self.spoolman_online = status.start()
         self.addCleanup(status.stop)
@@ -297,40 +305,26 @@ class OrcaAdapterTests(unittest.TestCase):
                 printer.config_value.return_value = address
                 sync.printer_url_from(self.host)
 
-    def test_legacy_url_is_discarded_without_losing_slot_settings(self):
-        settings = sync.config_from('{"printer_url":"http://192.168.1.99","ace_slot":3,"preview_only":false}')
-        self.assertEqual(settings, sync.DEFAULT_CONFIG | {"ace_slot": 3, "preview_only": False})
-
-    def test_preview_reports_project_color_mismatch_without_edits(self):
-        self.bundle.full_config_value.return_value = "#123456"
-        settings = sync.config_from('{"preview_only":true}')
-        sync.run_sync(self.host, settings, self.slots)
-        self.bundle.full_config_value.assert_called_once_with("filament_colour")
-        self.bundle.current_filament_presets.assert_not_called()
-        self.editor.begin_update.assert_not_called()
-        report = self.host.ui.message.call_args.args[0]
-        self.assertIn("ACE 1: PLA+ #009CBD", report)
-        self.assertIn("Project slot 1 is #123456; ACE slot 1 is #009CBD", report)
-
-    def test_unconfigured_run_updates_only_default_color_after_confirmation(self):
-        sync.run_sync(self.host, self.config, self.slots)
-        self.editor.begin_update.assert_called_once_with(1)
-        self.edit.set.assert_called_once_with(sync.COLOR_KEY, "#009CBD")
-        self.edit.commit.assert_called_once_with()
+    def test_legacy_url_and_slot_settings_are_ignored(self):
+        settings = sync.config_from(
+            '{"printer_url":"http://192.168.1.99","ace_slot":3,"orca_slot":2,"preview_only":true}'
+        )
+        self.assertEqual(settings, sync.DEFAULT_CONFIG | {"preview_only": True})
 
     def test_panel_refresh_shows_black_empty_and_unreported_slots_without_editing(self):
         self.bundle.current_printer_preset.return_value.config_value.return_value = "192.168.1.50"
-        post, config = Mock(), Mock()
+        post, config = Mock(), Mock(return_value="{}")
         with patch.object(sync, "read_moonraker", return_value=payload(
             spool(color=[0, 0, 0]), spool(1, status="empty"),
-        )) as read:
+        )) as read, patch.object(sync, "datetime", **{"now.return_value": datetime(2026, 11, 19, 15, 0, 59)}):
             sync.panel_action(self.host, config, "refresh", post)
         read.assert_called_once_with("http://192.168.1.50")
+        self.assertEqual(post.call_args.args[0]["status"], "Slots refreshed at 2026-11-19 15:00:59 (local time).")
         self.assertEqual([(row["number"], row["label"], row["color"])
                           for row in post.call_args.args[0]["rows"]],
                          [(1, "PLA+", "#000000"), (2, "Empty", None),
                           (3, "Not reported", None), (4, "Not reported", None)])
-        config.assert_not_called()
+        config.assert_called_once_with()
         self.spoolman_online.assert_not_called()
         self.editor.begin_update.assert_not_called()
 
@@ -345,52 +339,12 @@ class OrcaAdapterTests(unittest.TestCase):
         self.assertEqual(result["spoolman"], "Could not reach Moonraker.")
         self.editor.begin_update.assert_not_called()
 
-    def test_preset_sync_rejects_a_printer_switch_during_confirmation(self):
-        printer = self.bundle.current_printer_preset.return_value
-        printer.config_value.return_value = "192.168.1.51"
-        with self.assertRaisesRegex(sync.SyncError, "selected printer changed"):
-            sync.run_sync(self.host, self.config, self.slots, printer_url="http://192.168.1.50")
-        self.spoolman_online.assert_not_called()
-        self.editor.begin_update.assert_not_called()
-
     def test_panel_refresh_error_clears_previous_swatches(self):
         self.bundle.current_printer_preset.return_value.config_value.return_value = ""
         post = Mock()
-        sync.panel_action(self.host, lambda: "{}", "refresh", post)
+        sync.panel_action(self.host, lambda: '{"sync_spoolman_after_ace":true}', "refresh", post)
         self.assertEqual(post.call_args.args[0]["rows"], [])
         self.assertIn("Printer > Connection", post.call_args.args[0]["status"])
+        self.assertNotIn("Slots refreshed", post.call_args.args[0]["status"])
         self.assertFalse(post.call_args.args[0]["busy"])
-
-    def test_no_write_when_declined_or_already_matching(self):
-        self.host.ui.message.return_value = "no"
-        self.assertIsNone(sync.run_sync(self.host, self.config, self.slots))
-        with patch.object(self.preset, "config_value",
-                          {"filament_type": ["PLA"], sync.COLOR_KEY: ["#009cbd"]}.get):
-            self.assertIn("already matches", sync.run_sync(self.host, self.config, self.slots))
-        self.editor.begin_update.assert_not_called()
-
-    def test_rejects_shared_dirty_bundled_and_wrong_material_presets(self):
-        cases = [
-            (self.bundle, "current_filament_presets", lambda: [self.preset, self.preset], "shared"),
-            (self.bundle.filaments.edited_preset.return_value, "is_dirty", True, "Save or discard"),
-            (self.preset, "is_from_bundle", lambda: True, "dedicated"),
-            (self.preset, "config_value", {"filament_type": ["PETG"]}.get, "matching"),
-        ]
-        for obj, key, val, message in cases:
-            with self.subTest(message=message), patch.object(obj, key, val):
-                with self.assertRaisesRegex(sync.SyncError, message):
-                    sync.run_sync(self.host, self.config, self.slots)
-        self.editor.begin_update.assert_not_called()
-
-    def test_rechecks_target_after_confirmation(self):
-        self.host.ui.message.side_effect = lambda *_: setattr(self.preset, "name", "Other") or "yes"
-        with self.assertRaisesRegex(sync.SyncError, "changed while previewing"):
-            sync.run_sync(self.host, self.config, self.slots)
-        self.editor.begin_update.assert_not_called()
-
-    def test_does_not_commit_to_a_different_resolved_preset(self):
-        self.edit.target_name = "Different preset"
-        with self.assertRaisesRegex(sync.SyncError, "different preset assignment"):
-            sync.run_sync(self.host, self.config, self.slots)
-        self.edit.set.assert_not_called()
-        self.edit.commit.assert_not_called()
+        self.spoolman_online.assert_not_called()
